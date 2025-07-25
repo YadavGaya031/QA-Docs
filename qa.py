@@ -1,7 +1,6 @@
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.llms.base import LLM
-# from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint, ChatHuggingFace
 from langchain_groq import ChatGroq
 from langchain_core.embeddings import Embeddings
 import cohere
