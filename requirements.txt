@@ -1,0 +1,10 @@
+langchain
+langchain-Core
+openai
+faiss-cpu
+python-dotenv
+unstructured
+tqdm
+PyPDF2
+langchain-huggingFace
+huggingFace-hub
