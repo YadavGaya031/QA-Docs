@@ -1,10 +1,12 @@
 langchain
 langchain-Core
+langchain-community
 openai
 faiss-cpu
 python-dotenv
 unstructured
 tqdm
 PyPDF2
-langchain-huggingFace
-huggingFace-hub
+langchain-groq
+cohere
+streamlit
