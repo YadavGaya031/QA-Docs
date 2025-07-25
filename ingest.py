@@ -2,7 +2,6 @@ import os
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-# from langchain.schema import embeddings
 from langchain_core.embeddings import Embeddings
 from dotenv import load_dotenv
 import cohere
