@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pymongo
+passlib[bcrypt]
+pyjwt
+python-multipart
+cohere
+langchain
+langchain-community
+langchain-core
+langchain-groq
+faiss-cpu
+pydantic

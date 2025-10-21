@@ -1,0 +1,17 @@
+# Node (frontend)
+node_modules/
+dist/
+.env
+.vite/
+
+# Python (backend)
+__pycache__/
+.env
+*.pyc
+uploads/
+vectorstore/
+uploads/
+
+# OS/system files
+.DS_Store
+Thumbs.db
