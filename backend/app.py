@@ -1,41 +1,45 @@
 # backend/app.py
 import os
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-from bson.objectid import ObjectId
-from bson.errors import InvalidId
-from pymongo import MongoClient
 import shutil
+
+from bson.errors import InvalidId
+from bson.objectid import ObjectId
 from dotenv import load_dotenv
-from auth_utils import hash_password, verify_password, create_access_token, decode_access_token
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+from pymongo import MongoClient
+
+from auth_utils import (
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    verify_password,
+)
 from ingest import ingest_for_user
 from qa_core import ask_question_for_user
-from langchain_groq import ChatGroq
+import certifi
 
 load_dotenv()
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("MONGO_DB", "qa_app")
 UPLOAD_ROOT = os.getenv("UPLOAD_ROOT", "uploads")
-VECTORSTORE_ROOT = os.getenv("VECTORSTORE_ROOT", "vectorstore")
 
-# Ensure folders exist
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
-os.makedirs(VECTORSTORE_ROOT, exist_ok=True)
 
-client = MongoClient(MONGO_URI)
+# client = MongoClient(MONGO_URI)
+client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+
 db = client[DB_NAME]
-users_col = db["users"]   # store {username, email, password_hash, _id}
+users_col = db["users"]
 
-app = FastAPI(title="QA App with Auth")
+app = FastAPI(title="QA Docs API (Gemini + MongoDB Atlas)")
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173", "http://127.0.0.1:5174", "*"],  # Frontend URLs
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,120 +47,175 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-# Load LLM once at startup
-LLM = None
-@app.on_event("startup")
-def startup():
-    global LLM
-    try:
-        LLM = ChatGroq(model_name="groq/compound")
-    except Exception as e:
-        # log but keep server up (endpoints will return 503)
-        print("Failed to load LLM at startup:", e)
-        LLM = None
 
-# ------------------------
-# Models
-# ------------------------
 class RegisterModel(BaseModel):
     username: str
     email: str
     password: str
 
+
 class LoginModel(BaseModel):
     username: str
     password: str
 
-# ------------------------
-# Auth helpers
-# ------------------------
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    payload = decode_access_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid authentication token")
-
-    user_id_str = payload.get("user_id")
-    if not user_id_str:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
-    try:
-        user_obj_id = ObjectId(user_id_str)
-    except (InvalidId, TypeError):
-        raise HTTPException(status_code=401, detail="Invalid user id in token")
-
-    user = users_col.find_one({"_id": user_obj_id})
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    print("token payload: ", payload)
-    print("looking up user id: ", user_id_str )
-    return user
-
-
-
-# ------------------------
-# Routes: auth
-# ------------------------
-@app.post("/auth/register")
-def register(data: RegisterModel):
-    if users_col.find_one({"username": data.username}):
-        raise HTTPException(status_code=400, detail="username already exists")
-    hashed = hash_password(data.password)
-    result = users_col.insert_one({"username": data.username, "email": data.email, "password": hashed})
-    user_id = str(result.inserted_id)
-    # create user upload folder
-    os.makedirs(os.path.join(UPLOAD_ROOT, user_id), exist_ok=True)
-    return {"user_id": user_id, "username": data.username}
-
-@app.post("/auth/login")
-def login(data: LoginModel):
-    user = users_col.find_one({"username": data.username})
-    if not user:
-        raise HTTPException(status_code=400, detail="invalid username or password")
-    if not verify_password(data.password, user["password"]):
-        raise HTTPException(status_code=400, detail="invalid username or password")
-    token = create_access_token({"user_id": str(user["_id"]), "username": user["username"]})
-    return {"access_token": token}
-
-# ------------------------
-# Routes: upload + ingest + ask
-# ------------------------
-@app.post("/upload")
-def upload_file(file: UploadFile = File(...), user = Depends(get_current_user)):
-    user_id = str(user["_id"])
-    user_dir = os.path.join(UPLOAD_ROOT, user_id)
-    os.makedirs(user_dir, exist_ok=True)
-    dst_path = os.path.join(user_dir, file.filename)
-    with open(dst_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    # record metadata in DB
-    users_col.update_one({"_id": user["_id"]}, {"$push": {"files": {"filename": file.filename}}})
-    return {"status": "ok", "filename": file.filename}
-
-@app.post("/ingest")
-def ingest_endpoint(user = Depends(get_current_user)):
-    user_id = str(user["_id"])
-    user_docs_path = os.path.join(UPLOAD_ROOT, user_id)
-    if not os.path.isdir(user_docs_path):
-        raise HTTPException(status_code=400, detail="No uploaded docs for this user.")
-    try:
-        out_dir = ingest_for_user(user_id=user_id, docs_path=user_docs_path, db_dir_root=VECTORSTORE_ROOT)
-        return {"status": "ingested", "vectorstore_dir": out_dir}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 class AskRequest(BaseModel):
     query: str
 
-@app.post("/ask")
-def ask_endpoint(request: AskRequest, user = Depends(get_current_user)):
-    if LLM is None:
-        raise HTTPException(status_code=503, detail="LLM not ready")
-    user_id = str(user["_id"])
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    payload = decode_access_token(credentials.credentials)
+
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
     try:
-        answer = ask_question_for_user(request.query, LLM, user_id)
-        return {"query": request.query, "answer": answer}
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Vectorstore not found for user. Run /ingest.")
+        user_id = ObjectId(payload["user_id"])
+    except (InvalidId, KeyError):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = users_col.find_one({"_id": user_id})
+
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return user
+
+
+@app.get("/")
+def root():
+    return {"message": "QA Docs API is running"}
+
+
+@app.post("/auth/register")
+def register(data: RegisterModel):
+    if users_col.find_one({"username": data.username}):
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    result = users_col.insert_one(
+        {
+            "username": data.username,
+            "email": data.email,
+            "password": hash_password(data.password),
+        }
+    )
+
+    user_id = str(result.inserted_id)
+    os.makedirs(os.path.join(UPLOAD_ROOT, user_id), exist_ok=True)
+
+    return {
+        "message": "Registration successful",
+        "user_id": user_id,
+    }
+
+
+@app.post("/auth/login")
+def login(data: LoginModel):
+    user = users_col.find_one({"username": data.username})
+
+    if user is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid username or password",
+        )
+
+    if not verify_password(data.password, user["password"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid username or password",
+        )
+
+    token = create_access_token(
+        {
+            "user_id": str(user["_id"]),
+            "username": user["username"],
+        }
+    )
+
+    return {"access_token": token}
+
+
+@app.post("/upload")
+def upload_file(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    user_id = str(user["_id"])
+
+    user_folder = os.path.join(UPLOAD_ROOT, user_id)
+    os.makedirs(user_folder, exist_ok=True)
+
+    file_path = os.path.join(user_folder, file.filename)
+
+    with open(file_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    users_col.update_one(
+        {"_id": user["_id"]},
+        {
+            "$push": {
+                "files": {
+                    "filename": file.filename,
+                }
+            }
+        },
+    )
+
+    return {
+        "message": "File uploaded successfully",
+        "filename": file.filename,
+    }
+
+
+@app.post("/ingest")
+def ingest(user=Depends(get_current_user)):
+    user_id = str(user["_id"])
+
+    docs_path = os.path.join(UPLOAD_ROOT, user_id)
+
+    if not os.path.exists(docs_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Upload documents first.",
+        )
+
+    try:
+        result = ingest_for_user(
+            user_id=user_id,
+            docs_path=docs_path,
+        )
+
+        return {
+            "message": "Documents ingested successfully",
+            **result,
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
+
+
+@app.post("/ask")
+def ask(
+    request: AskRequest,
+    user=Depends(get_current_user),
+):
+    user_id = str(user["_id"])
+
+    try:
+        result = ask_question_for_user(
+            query=request.query,
+            user_id=user_id,
+        )
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )

@@ -1,63 +1,120 @@
-# backend/ingest.py
+
 import os
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_core.embeddings import Embeddings
+
 from dotenv import load_dotenv
-import cohere
+from pymongo import MongoClient
+
+from google import genai
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+)
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import certifi
 
 load_dotenv()
 
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+# -----------------------------
+# Config
+# -----------------------------
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("MONGO_DB", "qa_app")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-class CohereEmbeddings(Embeddings):
-    def __init__(self, api_key, model="embed-english-v3.0"):
-        self.client = cohere.Client(api_key)
-        self.model = model
+# client = MongoClient(MONGO_URI)
+client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+db = client[DB_NAME]
 
-    def embed_documents(self, texts):
-        response = self.client.embed(texts=texts, model=self.model, input_type="search_document")
-        return response.embeddings
+chunks_collection = db["chunks"]
+documents_collection = db["documents"]
 
-    def embed_query(self, text):
-        response = self.client.embed(texts=[text], model=self.model, input_type="search_query")
-        return response.embeddings[0]
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-def load_documents_from_path(path):
+
+# -----------------------------
+# Load Documents
+# -----------------------------
+def load_documents_from_path(path: str):
     documents = []
+
     for file in os.listdir(path):
         file_path = os.path.join(path, file)
+
         if file.endswith(".pdf"):
             loader = PyPDFLoader(file_path)
+
         elif file.endswith(".txt"):
             loader = TextLoader(file_path)
+
         else:
             continue
+
         docs = loader.load()
+
+        for doc in docs:
+            doc.metadata["filename"] = file
+
         documents.extend(docs)
+
     return documents
 
-def ingest_for_user(user_id: str, docs_path: str, db_dir_root="vectorstore"):
-    """
-    docs_path: folder containing files for the user (uploaded).
-    creates vectorstore at: db_dir_root/<user_id>/
-    """
-    os.makedirs(db_dir_root, exist_ok=True)
-    user_db_dir = os.path.join(db_dir_root, user_id)
-    # create user folder
-    os.makedirs(user_db_dir, exist_ok=True)
+
+# -----------------------------
+# Gemini Embedding
+# -----------------------------
+# def generate_embedding(text: str):
+
+#     response = gemini_client.models.embed_content(
+#         model="gemini-embedding-001",
+#         contents=text,
+#     )
+
+#     return response.embeddings[0].values
+
+def generate_embedding(text: str) -> list[float]:
+    response = gemini_client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text,
+    )
+
+    return response.embeddings[0].values
+
+
+# -----------------------------
+# Ingest
+# -----------------------------
+def ingest_for_user(user_id: str, docs_path: str):
 
     documents = load_documents_from_path(docs_path)
-    if not documents:
-        raise ValueError("No documents to ingest in path: " + docs_path)
 
-    # split
-    chunk_size = 4000
-    chunk_overlap = 100
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap, length_function=len)
+    if not documents:
+        raise ValueError("No documents found.")
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+    )
     chunks = splitter.split_documents(documents)
-    embeddings = CohereEmbeddings(api_key=COHERE_API_KEY)
-    vectordb = FAISS.from_documents(chunks, embeddings)
-    vectordb.save_local(user_db_dir)
-    return user_db_dir
+    inserted = 0
+    chunks_collection.delete_many({"userId": user_id})
+    for idx, chunk in enumerate(chunks):
+
+        embedding = generate_embedding(chunk.page_content)
+
+        doc = {
+            "userId": user_id,
+            "filename": chunk.metadata.get("filename"),
+            "page": chunk.metadata.get("page", 0),
+            "chunkIndex": idx,
+            "text": chunk.page_content,
+            "embedding": embedding,
+        }
+
+        chunks_collection.insert_one(doc)
+
+        inserted += 1
+
+    return {
+        "documents": len(documents),
+        "chunks": inserted,
+    }

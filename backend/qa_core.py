@@ -1,46 +1,136 @@
-# backend/qa_core.py
-import os, re
-from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain.llms.base import LLM
-from langchain_core.embeddings import Embeddings
-import cohere
+import os
+
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from google import genai
+import certifi
 
 load_dotenv()
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
-DB_DIR_ROOT = "vectorstore"
 
-class CohereEmbeddings(Embeddings):
-    def __init__(self, api_key, model="embed-english-v3.0"):
-        self.client = cohere.Client(api_key)
-        self.model = model
+# -----------------------------
+# Config
+# -----------------------------
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("MONGO_DB", "qa_app")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-    def embed_documents(self, texts):
-        response = self.client.embed(texts=texts, model=self.model, input_type="search_document")
-        return response.embeddings
+# client = MongoClient(MONGO_URI)
 
-    def embed_query(self, text):
-        response = self.client.embed(texts=[text], model=self.model, input_type="search_query")
-        return response.embeddings[0]
+client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+db = client[DB_NAME]
 
-def remove_think_tags(text):
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+chunks_collection = db["chunks"]
 
-def ask_question_for_user(query: str, llm: LLM, user_id: str):
-    user_db_dir = os.path.join(DB_DIR_ROOT, user_id)
-    if not os.path.isdir(user_db_dir):
-        raise FileNotFoundError("Vectorstore for user not found; run ingest for this user.")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-    embeddings = CohereEmbeddings(api_key=COHERE_API_KEY)
-    vectordb = FAISS.load_local(user_db_dir, embeddings, allow_dangerous_deserialization=True)
-    retriever = vectordb.as_retriever(search_type="similarity", search_kwargs={"k": 4})
 
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
-        return_source_documents=False
+# -----------------------------
+# Gemini Embedding
+# -----------------------------
+# def generate_embedding(text: str):
+
+#     response = gemini_client.models.embed_content(
+#         model="gemini-embedding-001",
+#         contents=text,
+#     )
+
+#     return response.embeddings[0].values
+
+
+def generate_embedding(text: str) -> list[float]:
+    response = gemini_client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text,
     )
-    result = qa_chain.invoke({"query": query})
-    raw = result["result"] if isinstance(result, dict) and "result" in result else str(result)
-    return remove_think_tags(raw)
+
+    return response.embeddings[0].values
+
+
+# -----------------------------
+# Retrieve Relevant Chunks
+# -----------------------------
+def retrieve_chunks(user_id: str, query: str, k: int = 5):
+
+    query_embedding = generate_embedding(query)
+    pipeline = [
+        # {
+        #     "$vectorSearch": {
+        #         "index": "vector_index",
+        #         "path": "embedding",
+        #         "queryVector": query_embedding,
+        #         "numCandidates": 100,
+        #         "limit": k,
+        #         # "filter": {"userId": user_id},
+        #         "filter": {"userId": {"$eq": user_id}},
+        #     }
+        # },
+        {
+            "$project": {
+                "_id": 0,
+                "text": 1,
+                "filename": 1,
+                "page": 1,
+                "score": {"$meta": "vectorSearchScore"},
+            }
+        },
+    ]
+    
+    return list(chunks_collection.aggregate(pipeline))
+
+
+# -----------------------------
+# Build Prompt
+# -----------------------------
+def build_prompt(query: str, docs):
+
+    context = ""
+
+    for doc in docs:
+
+        context += (
+            f"\nDocument: {doc['filename']}"
+            f"\nPage: {doc['page']}"
+            f"\nContent:\n{doc['text']}\n"
+        )
+
+    prompt = f"""
+You are an AI assistant.
+
+Answer ONLY using the information provided in the context below.
+
+If the answer is not present in the context, reply:
+
+"I couldn't find the answer in the uploaded documents."
+
+Context:
+{context}
+
+Question:
+{query}
+
+Give a clear and concise answer.
+"""
+
+    return prompt
+
+
+# -----------------------------
+# Ask Question
+# -----------------------------
+def ask_question_for_user(query: str, user_id: str):
+
+    docs = retrieve_chunks(user_id, query)
+    
+    if len(docs) == 0:
+        return {"answer": "No relevant information found.", "sources": []}
+
+    prompt = build_prompt(query, docs)
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+
+    answer = response.candidates[0].content.parts[0].text
+
+    
+    return {"answer": answer}
