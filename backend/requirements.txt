@@ -7,7 +7,7 @@ python-multipart==0.0.20
 
 pymongo==4.13.2
 
-pwdlib==0.2.1
+pwdlib[argon2]==0.2.1
 PyJWT==2.10.1
 
 google-genai==1.31.0
